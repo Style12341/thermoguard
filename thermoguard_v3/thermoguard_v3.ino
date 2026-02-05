@@ -37,6 +37,7 @@
 #define VBAT_READ_PIN 1
 #define ADC_CTRL_PIN 37
 #define BATTERY_CHARGING_PIN 48
+#define PRG_BUTTON_PIN 0
 #define ADC_RESOLUTION 12
 #define ADC_MAX_VOLTAGE 3.3
 #define VOLTAGE_R1 390
@@ -113,6 +114,7 @@ uint8_t confirmedNbTrials = 4;
 void loadCredentials();
 void runProvisioningMode();
 void hexStringToBytes(String hexStr, uint8_t *output, size_t len);
+bool isPrgButtonPressed();
 // ... existing debug declarations ...
 void debugPrintStartupBanner();
 void debugPrintResumeBanner();
@@ -157,7 +159,15 @@ void setup()
   pinMode(ADC_CTRL_PIN, OUTPUT);
   pinMode(VBAT_READ_PIN, INPUT);
   pinMode(BATTERY_CHARGING_PIN, INPUT_PULLDOWN);
+  pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
   analogReadResolution(ADC_RESOLUTION);
+
+  if (isPrgButtonPressed())
+  {
+    D_println("PRG button pressed. Forcing reprovisioning...");
+    credentialsLoaded = false;
+    runProvisioningMode();
+  }
 
   // 2. CREDENTIAL HANDLING
   // If we are waking from deep sleep, 'credentialsLoaded' will be true.
@@ -340,6 +350,11 @@ void hexStringToBytes(String hexStr, uint8_t *output, size_t len)
       output[i] = 0;
     }
   }
+}
+
+bool isPrgButtonPressed()
+{
+  return digitalRead(PRG_BUTTON_PIN) == LOW;
 }
 
 /* -------------------------- BATTERY -------------------------- */

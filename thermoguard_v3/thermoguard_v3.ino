@@ -4,11 +4,12 @@
  * 1. Sleep: RUI3 resumes context. No RTC_DATA_ATTR needed.
  * 2. Storage: Credentials stored in RUI3 Internal Config; Calibration stored in User Flash.
  * 3. Pinout: CHECK ALL PIN DEFINITIONS below for your specific hardware wiring.
+ * 4. Sensor: Updated to use AHT20 for ambient temperature.
  */
 
 #include "Arduino.h"
 #include <GyverMAX6675.h>   // Ensure this library is compatible or use MAX6675 library
-#include <Adafruit_BMP280.h>
+#include <Adafruit_AHTX0.h> // REPLACED BMP280 with AHT20 Library
 #include <Wire.h>
 
 /* -------------------------- DEBUG MACROS -------------------------- */
@@ -27,20 +28,19 @@
 #endif
 
 /* -------------------------- PIN DEFINITIONS (VERIFY THESE!) -------------------------- */
-/* RAK3178 / STM32WLE5 Pin Mapping - ADAPT TO YOUR BOARD */
+/* RAK3172 / STM32WLE5 Pin Mapping - ADAPT TO YOUR BOARD */
 #define CLK_PIN_1        WB_IO1   // Example: Software SPI SCK for MAX6675
 #define DATA_PIN_1       WB_IO2   // Example: Software SPI MISO for MAX6675
 #define CS_PIN_1         WB_IO3   // Example: CS for MAX6675
 
 // Battery Reading
-// RAK modules often use a dedicated internal divider. If using external:
 #define VBAT_READ_PIN    WB_A0    // Analog Input Pin
 #define ADC_CTRL_PIN     WB_IO4   // Pin to turn on voltage divider (if exists)
 #define BATTERY_CHARGING_PIN WB_IO5 
 
 #define ADC_RESOLUTION      12
 #define ADC_MAX_VOLTAGE     3.3   // RAK/STM32 usually 3.3V or 3.6V logic
-#define VOLTAGE_R1          390   // External Divider
+#define VOLTAGE_R1          47   // External Divider
 #define VOLTAGE_R2          100   // External Divider
 
 #define TEMP_ERROR_VALUE    -999.0
@@ -48,15 +48,15 @@
 #define FLASH_CALIBRATION_ADDR 0x00 // Offset start for User Flash
 
 /* -------------------------- DYNAMIC SLEEP CONFIG -------------------------- */
-#define TEMP_THRESHOLD_LOW  20.0f
-#define TEMP_THRESHOLD_HIGH 100.0f
+#define TEMP_THRESHOLD_LOW  50.0f
+#define TEMP_THRESHOLD_HIGH 130.0f
 #define SLEEP_TIME_LOW_MS   90000  // 1.5 min
 #define SLEEP_TIME_HIGH_MS  25000  // 25 sec
 
 /* -------------------------- SENSOR OBJECTS -------------------------- */
 // GyverMAX6675 allows software SPI on any pins
 GyverMAX6675<CLK_PIN_1, DATA_PIN_1, CS_PIN_1> tempSensor0;
-Adafruit_BMP280 bmp;
+Adafruit_AHTX0 aht; // AHT20 Object
 
 /* -------------------------- GLOBAL VARS -------------------------- */
 // In RUI3, these retained their value during sleep (RAM retention)
@@ -71,7 +71,7 @@ uint16_t batteryVoltage = 0;
 uint8_t batteryPercentage = 0;
 bool batteryLow = false;
 bool batteryCharging = false;
-bool bmpInitialized = false;
+bool ahtInitialized = false; // Renamed from bmpInitialized
 
 // Calibration Data (Loaded from Flash)
 struct CalibrationData {
@@ -101,7 +101,7 @@ void setup()
     delay(2000); // Give time for USB Serial
     
     D_println("==========================================");
-    D_println("   RAK3178 Thermoguard Port (RUI3)");
+    D_println("   RAK3172 Thermoguard Port (RUI3)");
     D_println("==========================================");
 
     // 2. Hardware Init
@@ -114,7 +114,6 @@ void setup()
     loadCalibration();
 
     // 4. Check Provisioning State
-    // We check if DevEUI is all zeros or empty. 
     uint8_t checkEui[8];
     api.lorawan.deui.get(checkEui, 8);
     bool isZero = true;
@@ -128,18 +127,16 @@ void setup()
     }
 
     // 5. Initialize Sensors
-    // BMP280
-    Wire.begin(); // Uses default SDA/SCL pins of the module
-    if (bmp.begin(0x76) || bmp.begin(0x77)) {
-        bmpInitialized = true;
-        bmp.setSampling(Adafruit_BMP280::MODE_FORCED,
-                        Adafruit_BMP280::SAMPLING_X1,
-                        Adafruit_BMP280::SAMPLING_X1,
-                        Adafruit_BMP280::FILTER_X16,
-                        Adafruit_BMP280::STANDBY_MS_500);
+    // AHT20 Initialization
+    Wire.begin(); // Uses default SDA(PA11)/SCL(PA12) pins of the module
+    
+    // AHT20 usually uses address 0x38. The library handles this.
+    if (aht.begin()) {
+        ahtInitialized = true;
         sensorConnected[1] = true;
+        D_println("[Setup] AHT20 Found");
     } else {
-        D_println("[Setup] BMP280 Not Found");
+        D_println("[Setup] AHT20 Not Found. Check wiring (SDA=PA11, SCL=PA12)");
         sensorConnected[1] = false;
     }
     
@@ -199,7 +196,6 @@ void loop()
     // 1. Wait for Join if not joined
     if (api.lorawan.njs.get() == 0) {
         // Not joined yet. 
-        // RUI3 handles retries in background usually, but we can prevent app logic
         D_print(".");
         delay(5000);
         return; 
@@ -236,15 +232,7 @@ void loop()
     
     D_printf("[Loop] Max Temp: %.2f C -> Sleep Time: %u ms\r\n", maxTemp, sleepTime);
     
-    // 5. Send Packet
-    // (Buffer is populated in prepareTxFrame into global 'collected_data' or similar, 
-    // but here we pass the buffer directly).
-    // Note: RUI3 send is non-blocking. The sleep below needs to handle this.
-    // RUI3 `sleep.all` automatically waits for TX to finish or schedules wakeup.
-    
-    // 6. Sleep
-    // RUI3 specific: sleep.all puts the device in low power and sets a timer.
-    // When timer expires, code resumes HERE (next loop iteration).
+    // 5. Sleep
     api.system.sleep.all(sleepTime); 
 }
 
@@ -270,23 +258,32 @@ void readTemperatures() {
         D_println("MAX6675 Read Failed");
     }
 
-    // Sensor 1: BMP280
-    if (bmpInitialized && bmp.takeForcedMeasurement()) {
-         float temp = bmp.readTemperature();
-         if (!isnan(temp) && temp > -50 && temp < 1000) {
-             currentTemperature[1] = temp;
-             lastValidTemperature[1] = temp;
-             lastReadSuccessful[1] = true;
-             successfulReadings[1]++;
-             D_printf("BMP280: %.2f C\r\n", temp);
-         } else {
+    // Sensor 1: AHT20 (Ambient)
+    if (ahtInitialized) {
+        sensors_event_t humidity, temp;
+        // getEvent populates the temp and humidity objects
+        if(aht.getEvent(&humidity, &temp)) { 
+            float t = temp.temperature;
+             if (!isnan(t) && t > -50 && t < 100) {
+                 currentTemperature[1] = t;
+                 lastValidTemperature[1] = t;
+                 lastReadSuccessful[1] = true;
+                 successfulReadings[1]++;
+                 D_printf("AHT20: %.2f C (Hum: %.2f %%)\r\n", t, humidity.relative_humidity);
+             } else {
+                 lastReadSuccessful[1] = false;
+                 failedReadings[1]++;
+                 D_println("AHT20 Value Invalid");
+             }
+        } else {
              lastReadSuccessful[1] = false;
              failedReadings[1]++;
-         }
-    } else if (bmpInitialized) {
+             D_println("AHT20 Read Failed (Bus error)");
+        }
+    } else {
         lastReadSuccessful[1] = false;
         failedReadings[1]++;
-        D_println("BMP280 Read Failed");
+        D_println("AHT20 Not Initialized");
     }
 }
 
@@ -294,9 +291,6 @@ void readBatteryVoltage() {
     digitalWrite(ADC_CTRL_PIN, HIGH);
     delay(10); // Allow stabilize
     
-    // RUI3 API for analog read
-    // Note: If using internal battery pin of RAK3172/8, use api.system.bat.get()
-    // But respecting your custom divider logic:
     uint32_t rawSum = 0;
     for(int i=0; i<3; i++) {
         rawSum += analogRead(VBAT_READ_PIN);
@@ -306,7 +300,6 @@ void readBatteryVoltage() {
     float avgRaw = rawSum / 3.0;
     
     // Calc Logic
-    // V = Raw * (3.3 / 4096) * ((R1+R2)/R2) * Calibration
     const float adcMax = (1 << ADC_RESOLUTION) - 1;
     float factor = (ADC_MAX_VOLTAGE / adcMax) * ((float)(VOLTAGE_R1 + VOLTAGE_R2) / (float)VOLTAGE_R2) * (calData.vMeas / calData.vRep);
     
@@ -327,7 +320,7 @@ void readBatteryVoltage() {
 void prepareTxFrame(uint8_t port, float t0, float t1) {
     uint8_t payload[12];
     
-    // Same struct packing as your ESP32 code
+    // Using a union to map struct to bytes
     union {
         struct {
             float temperature0;
@@ -364,13 +357,12 @@ void prepareTxFrame(uint8_t port, float t0, float t1) {
 }
 
 /* -------------------------- PROVISIONING / STORAGE -------------------------- */
-
+// (Same as before)
 void loadCalibration() {
     uint8_t buff[sizeof(CalibrationData)];
     if (api.system.flash.get(FLASH_CALIBRATION_ADDR, buff, sizeof(CalibrationData))) {
         memcpy(&calData, buff, sizeof(CalibrationData));
         if (calData.magic != 0xA5A5A5A5) {
-            // Defaults
             calData.vMeas = 1.0;
             calData.vRep = 1.0;
         }
@@ -406,7 +398,6 @@ void runProvisioningMode() {
             String line = Serial.readStringUntil('\n');
             line.trim();
             if (line.length() > 20) {
-                // Simplified CSV parsing
                 int c1 = line.indexOf(',');
                 int c2 = line.indexOf(',', c1+1);
                 int c3 = line.indexOf(',', c2+1);
@@ -422,11 +413,9 @@ void runProvisioningMode() {
                     hexStringToBytes(sDevEui, bufEui, 8);
                     hexStringToBytes(sAppKey, bufKey, 16);
                     
-                    // Set RUI3 Credentials
                     api.lorawan.deui.set(bufEui, 8);
                     api.lorawan.appkey.set(bufKey, 16);
                     
-                    // Save Calibration
                     calData.vMeas = sVMeas.toFloat();
                     calData.vRep = sVRep.toFloat();
                     saveCalibration();

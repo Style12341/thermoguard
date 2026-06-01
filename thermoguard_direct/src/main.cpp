@@ -33,6 +33,30 @@ String            deviceId            = "";
 constexpr int     NUM_WM_PARAMS       = 7;
 WiFiManagerParameter* wmParams[NUM_WM_PARAMS] = {};
 
+// ---- MQTT Config Callback ----
+void configCallback(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    D_printf("Config parse error: %s\n", err.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("send_interval")) return;
+
+  long interval = doc["send_interval"];
+  if (interval < 5 || interval > 3600) {
+    D_printf("Config rejected: send_interval=%ld out of range (5-3600) from %s\n",
+             interval, topic);
+    return;
+  }
+
+  config.readIntervalSec = (uint32_t)interval;
+  saveConfig();
+  D_printf("Config applied: send_interval=%us from %s\n",
+           config.readIntervalSec, topic);
+}
+
 // ---- Helpers ----
 void discover(DeviceAddress* addrs, uint8_t& count) {
   sensors.begin();
@@ -57,7 +81,13 @@ bool mqttConnect() {
 
   if (ok) {
     mqtt.publish(statusTopic.c_str(), "{\"online\":true}", true);
-    D_println("MQTT connected");
+
+    for (int i = 0; i < deviceCount; i++) {
+      String topic = "thermoguard/direct/" + String(config.appId) + "/" +
+                     devices[i]->sensorId() + "/config";
+      mqtt.subscribe(topic.c_str());
+      D_printf("Subscribed to config: %s\n", topic.c_str());
+    }
     return true;
   }
   D_printf("MQTT rc=%d\n", mqtt.state());
@@ -184,6 +214,7 @@ void setup() {
 
   mqtt.setServer(config.mqttBroker, config.mqttPort);
   mqtt.setKeepAlive(60);
+  mqtt.setCallback(configCallback);
   D_printf("MQTT: %s:%u  user=%s  appId=%s\n",
            config.mqttBroker, config.mqttPort,
            config.mqttUser, config.appId);

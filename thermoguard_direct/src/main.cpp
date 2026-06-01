@@ -45,8 +45,8 @@ void configCallback(char* topic, byte* payload, unsigned int length) {
   if (!doc.containsKey("send_interval")) return;
 
   long interval = doc["send_interval"];
-  if (interval < 5 || interval > 3600) {
-    D_printf("Config rejected: send_interval=%ld out of range (5-3600) from %s\n",
+  if (interval < 5 || interval > 300) {
+    D_printf("Config rejected: send_interval=%ld out of range (5-300) from %s\n",
              interval, topic);
     return;
   }

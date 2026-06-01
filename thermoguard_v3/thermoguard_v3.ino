@@ -13,7 +13,7 @@
 #include <Preferences.h>
 
 /* -------------------------- DEBUG MACROS -------------------------- */
-#define DEBUG
+
 
 #ifdef DEBUG
 #define D_SerialBegin(...) Serial.begin(__VA_ARGS__);
@@ -53,10 +53,11 @@
 #define BATTERY_ADC_SAMPLES 3
 
 /* -------------------------- DYNAMIC SLEEP CONFIG -------------------------- */
-#define TEMP_THRESHOLD_LOW 20.0f
-#define TEMP_THRESHOLD_HIGH 100.0f
-#define SLEEP_TIME_LOW_MS 90000  // 1 min 30 sec
-#define SLEEP_TIME_HIGH_MS 25000 // 25 sec
+#define TEMP_THRESHOLD_LOW 40.0f
+#define TEMP_THRESHOLD_HIGH 110.0f
+#define SLEEP_TIME_LOW_MS 300000 // 5 min
+#define SLEEP_TIME_HIGH_MS 30000 // 30 sec
+#define STARTUP_MEASURES_BEFORE_DYNAMIC 6
 
 /* -------------------------- SENSOR OBJECTS -------------------------- */
 GyverMAX6675<CLK_PIN_1, DATA_PIN_1, CS_PIN_1> tempSensor0;
@@ -82,6 +83,7 @@ RTC_DATA_ATTR uint32_t wakeCounter = 0;
 
 // Sensor State
 RTC_DATA_ATTR float lastValidTemperature[NUM_SENSORS] = {TEMP_ERROR_VALUE, TEMP_ERROR_VALUE};
+RTC_DATA_ATTR float previousSentTemp[NUM_SENSORS] = {TEMP_ERROR_VALUE, TEMP_ERROR_VALUE};
 RTC_DATA_ATTR unsigned long successfulReadings[NUM_SENSORS] = {0, 0};
 RTC_DATA_ATTR unsigned long failedReadings[NUM_SENSORS] = {0, 0};
 RTC_DATA_ATTR bool sensorConnected[NUM_SENSORS] = {false, false};
@@ -703,6 +705,20 @@ void handleLoRaWANStateMachine()
 
         float t0 = getTemperatureToSend(0);
         float t1 = getTemperatureToSend(1);
+
+        bool deltaTExceeded = false;
+        if (previousSentTemp[0] != TEMP_ERROR_VALUE && t0 != TEMP_ERROR_VALUE && abs(t0 - previousSentTemp[0]) >= 5.0)
+        {
+            deltaTExceeded = true;
+        }
+        if (previousSentTemp[1] != TEMP_ERROR_VALUE && t1 != TEMP_ERROR_VALUE && abs(t1 - previousSentTemp[1]) >= 5.0)
+        {
+            deltaTExceeded = true;
+        }
+
+        previousSentTemp[0] = t0;
+        previousSentTemp[1] = t1;
+
         debugLoRaSendDetails(t0, t1);
 
         // --- DYNAMIC SLEEP CALCULATION ---
@@ -723,7 +739,21 @@ void handleLoRaWANStateMachine()
             }
         }
 
-        if (validTempFound)
+        if (wakeCounter <= STARTUP_MEASURES_BEFORE_DYNAMIC)
+        {
+            appTxDutyCycle = SLEEP_TIME_HIGH_MS;
+            D_print("Dynamic Sleep: Startup Phase (First 6 Reads) -> Interval ");
+            D_print(appTxDutyCycle);
+            D_println(" ms");
+        }
+        else if (deltaTExceeded)
+        {
+            appTxDutyCycle = SLEEP_TIME_HIGH_MS;
+            D_print("Dynamic Sleep: Delta T >= 5C -> Interval ");
+            D_print(appTxDutyCycle);
+            D_println(" ms");
+        }
+        else if (validTempFound)
         {
             appTxDutyCycle = calculateDynamicDutyCycle(maxTemp);
             D_print("Dynamic Sleep: Max Temp ");
@@ -734,7 +764,7 @@ void handleLoRaWANStateMachine()
         }
         else
         {
-            appTxDutyCycle = SLEEP_TIME_HIGH_MS;
+            appTxDutyCycle = SLEEP_TIME_LOW_MS;
             D_println("Dynamic Sleep: No valid sensors. Defaulting to slow interval.");
         }
 
